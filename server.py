@@ -257,10 +257,22 @@ class GeminiOAuthManager:
             return self._credentials["access_token"]
 
 
+def parse_rate_limit_delay(error_text: str) -> Optional[float]:
+    """Parse retry delay from Gemini rate limit error message.
+
+    Example: "Your quota will reset after 34s." -> 34.0
+    """
+    match = re.search(r'reset after (\d+(?:\.\d+)?)\s*s', error_text)
+    if match:
+        return float(match.group(1))
+    return None
+
+
 class CloudCodeAssistClient:
     """Client for Google Cloud Code Assist API."""
 
     BASE_URL = "https://cloudcode-pa.googleapis.com"
+    MAX_RATE_LIMIT_RETRIES = 3  # Maximum number of retries for rate limiting
 
     def __init__(self, oauth_manager: GeminiOAuthManager):
         self._oauth_manager = oauth_manager
@@ -357,12 +369,11 @@ class CloudCodeAssistClient:
         model: str,
         gemini_request: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Non-streaming content generation."""
+        """Non-streaming content generation with rate limit retry."""
         if not self._initialized:
             await self.initialize()
 
         client = await self._get_http_client()
-        headers = await self._get_headers()
 
         # Wrap request in Cloud Code Assist format
         # Note: model should be just the name (e.g., "gemini-3-flash"), not "models/gemini-3-flash"
@@ -372,29 +383,43 @@ class CloudCodeAssistClient:
             "request": gemini_request
         }
 
-        response = await client.post(
-            f"{self.BASE_URL}/v1internal:generateContent",
-            headers=headers,
-            json=wrapped_request
-        )
-        response.raise_for_status()
+        for attempt in range(self.MAX_RATE_LIMIT_RETRIES + 1):
+            headers = await self._get_headers()
 
-        result = response.json()
-        # Unwrap response
-        return result.get("response", result)
+            response = await client.post(
+                f"{self.BASE_URL}/v1internal:generateContent",
+                headers=headers,
+                json=wrapped_request
+            )
+
+            if response.status_code == 429:
+                error_text = response.text
+                delay = parse_rate_limit_delay(error_text)
+                if delay and attempt < self.MAX_RATE_LIMIT_RETRIES:
+                    logger.info(f"Rate limited, waiting {delay}s before retry (attempt {attempt + 1}/{self.MAX_RATE_LIMIT_RETRIES})")
+                    await asyncio.sleep(delay + 1)  # Add 1 second buffer
+                    continue
+                else:
+                    response.raise_for_status()
+
+            response.raise_for_status()
+            result = response.json()
+            # Unwrap response
+            return result.get("response", result)
+
+        # Should not reach here, but just in case
+        raise httpx.HTTPStatusError("Max retries exceeded", request=None, response=response)
 
     async def stream_generate_content(
         self,
         model: str,
         gemini_request: Dict[str, Any]
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Streaming content generation via SSE."""
+        """Streaming content generation via SSE with rate limit retry."""
         if not self._initialized:
             await self.initialize()
 
         client = await self._get_http_client()
-        headers = await self._get_headers()
-        headers["Accept"] = "text/event-stream"
 
         # Wrap request in Cloud Code Assist format
         # Note: model should be just the name (e.g., "gemini-3-flash"), not "models/gemini-3-flash"
@@ -404,31 +429,55 @@ class CloudCodeAssistClient:
             "request": gemini_request
         }
 
-        async with client.stream(
-            "POST",
-            f"{self.BASE_URL}/v1internal:streamGenerateContent?alt=sse",
-            headers=headers,
-            json=wrapped_request
-        ) as response:
-            response.raise_for_status()
+        for attempt in range(self.MAX_RATE_LIMIT_RETRIES + 1):
+            headers = await self._get_headers()
+            headers["Accept"] = "text/event-stream"
 
-            async for line in response.aiter_lines():
-                if not line:
-                    continue
-
-                # Parse SSE format
-                if line.startswith("data: "):
-                    data_str = line[6:]  # Remove "data: " prefix
-                    if data_str.strip() == "[DONE]":
-                        break
-
-                    try:
-                        data = json.loads(data_str)
-                        # Unwrap response
-                        yield data.get("response", data)
-                    except json.JSONDecodeError:
-                        logger.warning(f"Failed to parse SSE data: {data_str[:100]}")
+            async with client.stream(
+                "POST",
+                f"{self.BASE_URL}/v1internal:streamGenerateContent?alt=sse",
+                headers=headers,
+                json=wrapped_request
+            ) as response:
+                if response.status_code == 429:
+                    error_body = await response.aread()
+                    error_text = error_body.decode('utf-8', errors='ignore')
+                    delay = parse_rate_limit_delay(error_text)
+                    if delay and attempt < self.MAX_RATE_LIMIT_RETRIES:
+                        logger.info(f"Rate limited, waiting {delay}s before retry (attempt {attempt + 1}/{self.MAX_RATE_LIMIT_RETRIES})")
+                        await asyncio.sleep(delay + 1)  # Add 1 second buffer
                         continue
+                    else:
+                        logger.error(f"Cloud Code Assist streaming error {response.status_code}: {error_text[:500]}")
+                        response.raise_for_status()
+
+                if response.status_code != 200:
+                    error_body = await response.aread()
+                    error_text = error_body.decode('utf-8', errors='ignore')
+                    logger.error(f"Cloud Code Assist streaming error {response.status_code}: {error_text[:500]}")
+                    response.raise_for_status()
+
+                # Successfully connected, stream the response
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+
+                    # Parse SSE format
+                    if line.startswith("data: "):
+                        data_str = line[6:]  # Remove "data: " prefix
+                        if data_str.strip() == "[DONE]":
+                            break
+
+                        try:
+                            data = json.loads(data_str)
+                            # Unwrap response
+                            yield data.get("response", data)
+                        except json.JSONDecodeError:
+                            logger.warning(f"Failed to parse SSE data: {data_str[:100]}")
+                            continue
+
+                # If we got here, streaming was successful - exit the retry loop
+                return
 
 
 # Global OAuth manager and Cloud Code Assist client (lazy initialized)
@@ -467,35 +516,45 @@ def convert_anthropic_to_gemini_format(anthropic_request: "MessagesRequest") -> 
             parts.append({"text": content})
         else:
             for block in content:
-                if hasattr(block, "type"):
-                    if block.type == "text":
-                        parts.append({"text": block.text})
-                    elif block.type == "tool_use":
+                # Handle both object-based and dict-based blocks
+                block_type = getattr(block, "type", None) or (block.get("type") if isinstance(block, dict) else None)
+
+                if block_type == "text":
+                    text = getattr(block, "text", None) or (block.get("text") if isinstance(block, dict) else "")
+                    parts.append({"text": text})
+                elif block_type == "tool_use":
+                    name = getattr(block, "name", None) or (block.get("name") if isinstance(block, dict) else "")
+                    input_data = getattr(block, "input", None) or (block.get("input") if isinstance(block, dict) else {})
+                    parts.append({
+                        "functionCall": {
+                            "name": name,
+                            "args": input_data
+                        },
+                        # Gemini 3 requires thought_signature for function calls
+                        # Use bypass signature since we can't preserve signatures through Anthropic format
+                        "thought_signature": "skip_thought_signature_validator"
+                    })
+                elif block_type == "tool_result":
+                    # Tool results in Gemini format
+                    block_content = getattr(block, "content", None) or (block.get("content") if isinstance(block, dict) else "")
+                    tool_use_id = getattr(block, "tool_use_id", None) or (block.get("tool_use_id") if isinstance(block, dict) else "")
+                    result_content = parse_tool_result_content(block_content)
+                    parts.append({
+                        "functionResponse": {
+                            "name": tool_use_id,  # Gemini uses the function name here
+                            "response": {"result": result_content}
+                        }
+                    })
+                elif block_type == "image":
+                    # Handle image content
+                    source = getattr(block, "source", None) or (block.get("source") if isinstance(block, dict) else {})
+                    if isinstance(source, dict) and source.get("type") == "base64":
                         parts.append({
-                            "functionCall": {
-                                "name": block.name,
-                                "args": block.input
+                            "inlineData": {
+                                "mimeType": source.get("media_type", "image/png"),
+                                "data": source.get("data", "")
                             }
                         })
-                    elif block.type == "tool_result":
-                        # Tool results in Gemini format
-                        result_content = parse_tool_result_content(block.content)
-                        parts.append({
-                            "functionResponse": {
-                                "name": block.tool_use_id,  # Gemini uses the function name here
-                                "response": {"result": result_content}
-                            }
-                        })
-                    elif block.type == "image":
-                        # Handle image content
-                        source = block.source
-                        if source.get("type") == "base64":
-                            parts.append({
-                                "inlineData": {
-                                    "mimeType": source.get("media_type", "image/png"),
-                                    "data": source.get("data", "")
-                                }
-                            })
 
         if parts:
             contents.append({"role": role, "parts": parts})
@@ -778,6 +837,7 @@ def clean_gemini_schema(schema: Any) -> Any:
         # Remove specific keys unsupported by Gemini tool parameters
         schema.pop("additionalProperties", None)
         schema.pop("default", None)
+        schema.pop("$schema", None)  # JSON Schema meta field not supported
 
         # Check for unsupported 'format' in string types
         if schema.get("type") == "string" and "format" in schema:
