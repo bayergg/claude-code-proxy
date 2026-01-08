@@ -3,7 +3,7 @@ import uvicorn
 import logging
 import json
 from pydantic import BaseModel, Field, field_validator
-from typing import List, Dict, Any, Optional, Union, Literal
+from typing import List, Dict, Any, Optional, Union, Literal, AsyncGenerator
 import httpx
 import os
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 import re
 from datetime import datetime
 import sys
+import asyncio
+from pathlib import Path
 
 # Load environment variables from .env file
 load_dotenv()
@@ -89,6 +91,13 @@ VERTEX_LOCATION = os.environ.get("VERTEX_LOCATION", "unset")
 # Option to use Gemini API key instead of ADC for Vertex AI
 USE_VERTEX_AUTH = os.environ.get("USE_VERTEX_AUTH", "False").lower() == "true"
 
+# Option to use Gemini OAuth (Cloud Code Assist API)
+USE_GEMINI_OAUTH = os.environ.get("USE_GEMINI_OAUTH", "False").lower() == "true"
+GEMINI_OAUTH_CREDS_PATH = os.environ.get(
+    "GEMINI_OAUTH_CREDS_PATH",
+    os.path.expanduser("~/.gemini/oauth_creds.json")
+)
+
 # Get OpenAI base URL from environment (if set)
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
 
@@ -119,8 +128,648 @@ OPENAI_MODELS = [
 # List of Gemini models
 GEMINI_MODELS = [
     "gemini-2.5-flash",
-    "gemini-2.5-pro"
+    "gemini-2.5-pro",
+    "gemini-3-flash-preview",  # Gemini 3 requires -preview suffix
+    "gemini-3-pro-preview",    # Gemini 3 requires -preview suffix
 ]
+
+# ============================================================================
+# Gemini OAuth Support (Cloud Code Assist API)
+# ============================================================================
+
+class GeminiOAuthManager:
+    """Manages Google OAuth credentials for Cloud Code Assist API."""
+
+    TOKEN_REFRESH_URL = "https://oauth2.googleapis.com/token"
+    # These are the official Gemini CLI OAuth credentials
+    CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
+    CLIENT_SECRET = "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"
+    TOKEN_EXPIRY_BUFFER_MS = 5 * 60 * 1000  # 5 minutes buffer
+
+    def __init__(self, creds_path: str = None):
+        self._creds_path = creds_path or GEMINI_OAUTH_CREDS_PATH
+        self._credentials: Optional[Dict[str, Any]] = None
+        self._lock = asyncio.Lock()
+        self._http_client: Optional[httpx.AsyncClient] = None
+
+    async def _get_http_client(self) -> httpx.AsyncClient:
+        """Get or create HTTP client."""
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(timeout=30.0)
+        return self._http_client
+
+    async def load_credentials(self) -> Dict[str, Any]:
+        """Load OAuth credentials from disk."""
+        if not os.path.exists(self._creds_path):
+            raise HTTPException(
+                status_code=500,
+                detail=f"OAuth credentials not found at {self._creds_path}. "
+                       f"Please run 'gemini auth login' to authenticate."
+            )
+
+        with open(self._creds_path, 'r') as f:
+            self._credentials = json.load(f)
+
+        return self._credentials
+
+    def _save_credentials(self) -> None:
+        """Save updated credentials back to disk."""
+        if self._credentials:
+            with open(self._creds_path, 'w') as f:
+                json.dump(self._credentials, f, indent=2)
+
+    def is_token_expired(self) -> bool:
+        """Check if current token is expired (with buffer)."""
+        if not self._credentials:
+            return True
+
+        expiry_date = self._credentials.get("expiry_date", 0)
+        current_time = int(time.time() * 1000)  # Convert to milliseconds
+
+        return current_time >= (expiry_date - self.TOKEN_EXPIRY_BUFFER_MS)
+
+    async def refresh_token(self) -> None:
+        """Refresh the OAuth access token."""
+        if not self._credentials or not self._credentials.get("refresh_token"):
+            raise HTTPException(
+                status_code=401,
+                detail="No refresh token available. Please run 'gemini auth login'."
+            )
+
+        client = await self._get_http_client()
+
+        try:
+            response = await client.post(
+                self.TOKEN_REFRESH_URL,
+                data={
+                    "client_id": self.CLIENT_ID,
+                    "client_secret": self.CLIENT_SECRET,
+                    "refresh_token": self._credentials["refresh_token"],
+                    "grant_type": "refresh_token"
+                }
+            )
+
+            if response.status_code != 200:
+                error_data = response.json() if response.content else {}
+                error_code = error_data.get("error", "unknown")
+
+                if error_code == "invalid_grant":
+                    raise HTTPException(
+                        status_code=401,
+                        detail="OAuth token has been revoked. Please run 'gemini auth login' to re-authenticate."
+                    )
+
+                raise HTTPException(
+                    status_code=401,
+                    detail=f"Token refresh failed: {error_data.get('error_description', str(error_data))}"
+                )
+
+            token_data = response.json()
+
+            # Update credentials
+            self._credentials["access_token"] = token_data["access_token"]
+            self._credentials["expiry_date"] = int(time.time() * 1000) + (token_data.get("expires_in", 3600) * 1000)
+
+            if "refresh_token" in token_data:
+                self._credentials["refresh_token"] = token_data["refresh_token"]
+
+            # Save to disk
+            self._save_credentials()
+
+            logger.debug("Successfully refreshed OAuth token")
+
+        except httpx.HTTPError as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Network error during token refresh: {str(e)}"
+            )
+
+    async def get_access_token(self) -> str:
+        """Get valid access token, refreshing if expired."""
+        async with self._lock:
+            if self._credentials is None:
+                await self.load_credentials()
+
+            if self.is_token_expired():
+                logger.debug("OAuth token expired, refreshing...")
+                await self.refresh_token()
+
+            return self._credentials["access_token"]
+
+
+class CloudCodeAssistClient:
+    """Client for Google Cloud Code Assist API."""
+
+    BASE_URL = "https://cloudcode-pa.googleapis.com"
+
+    def __init__(self, oauth_manager: GeminiOAuthManager):
+        self._oauth_manager = oauth_manager
+        self._project_id: Optional[str] = None
+        self._http_client: Optional[httpx.AsyncClient] = None
+        self._initialized = False
+
+    async def _get_http_client(self) -> httpx.AsyncClient:
+        """Get or create HTTP client."""
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(timeout=120.0)
+        return self._http_client
+
+    async def _get_headers(self) -> Dict[str, str]:
+        """Get HTTP headers with valid OAuth token."""
+        access_token = await self._oauth_manager.get_access_token()
+        return {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "google-api-nodejs-client/9.15.1",
+            "X-Goog-Api-Client": "gl-node/22.17.0",
+            "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+        }
+
+    async def initialize(self) -> None:
+        """Initialize the client and load/onboard project."""
+        if self._initialized:
+            return
+
+        try:
+            result = await self.load_code_assist()
+            # Extract project ID from response - check various possible field names
+            self._project_id = (
+                result.get("cloudaicompanionProject") or
+                result.get("managedProject") or
+                (result.get("project", {}).get("name") if isinstance(result.get("project"), dict) else None) or
+                (result.get("project", {}).get("projectId") if isinstance(result.get("project"), dict) else None)
+            )
+
+            logger.debug(f"Loaded Cloud Code Assist project: {self._project_id}")
+
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (404, 403):
+                # Try onboarding for free tier
+                logger.debug("No existing project, attempting to onboard...")
+                result = await self.onboard_user()
+                if "managedProject" in result:
+                    self._project_id = result["managedProject"]
+                logger.debug(f"Onboarded to Cloud Code Assist project: {self._project_id}")
+            else:
+                raise
+
+        self._initialized = True
+
+    async def load_code_assist(self) -> Dict[str, Any]:
+        """Load existing Code Assist project."""
+        client = await self._get_http_client()
+        headers = await self._get_headers()
+
+        response = await client.post(
+            f"{self.BASE_URL}/v1internal:loadCodeAssist",
+            headers=headers,
+            json={"metadata": {}}
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def onboard_user(self) -> Dict[str, Any]:
+        """Onboard user for free tier access."""
+        client = await self._get_http_client()
+        headers = await self._get_headers()
+
+        # Retry logic for onboarding
+        max_retries = 5
+        for attempt in range(max_retries):
+            response = await client.post(
+                f"{self.BASE_URL}/v1internal:onboardUser",
+                headers=headers,
+                json={"tier": "FREE", "metadata": {}}
+            )
+
+            if response.status_code == 200:
+                return response.json()
+
+            if attempt < max_retries - 1:
+                logger.debug(f"Onboarding attempt {attempt + 1} failed, retrying...")
+                await asyncio.sleep(2)
+
+        response.raise_for_status()
+        return {}
+
+    async def generate_content(
+        self,
+        model: str,
+        gemini_request: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Non-streaming content generation."""
+        if not self._initialized:
+            await self.initialize()
+
+        client = await self._get_http_client()
+        headers = await self._get_headers()
+
+        # Wrap request in Cloud Code Assist format
+        # Note: model should be just the name (e.g., "gemini-3-flash"), not "models/gemini-3-flash"
+        wrapped_request = {
+            "project": self._project_id,
+            "model": model,
+            "request": gemini_request
+        }
+
+        response = await client.post(
+            f"{self.BASE_URL}/v1internal:generateContent",
+            headers=headers,
+            json=wrapped_request
+        )
+        response.raise_for_status()
+
+        result = response.json()
+        # Unwrap response
+        return result.get("response", result)
+
+    async def stream_generate_content(
+        self,
+        model: str,
+        gemini_request: Dict[str, Any]
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Streaming content generation via SSE."""
+        if not self._initialized:
+            await self.initialize()
+
+        client = await self._get_http_client()
+        headers = await self._get_headers()
+        headers["Accept"] = "text/event-stream"
+
+        # Wrap request in Cloud Code Assist format
+        # Note: model should be just the name (e.g., "gemini-3-flash"), not "models/gemini-3-flash"
+        wrapped_request = {
+            "project": self._project_id,
+            "model": model,
+            "request": gemini_request
+        }
+
+        async with client.stream(
+            "POST",
+            f"{self.BASE_URL}/v1internal:streamGenerateContent?alt=sse",
+            headers=headers,
+            json=wrapped_request
+        ) as response:
+            response.raise_for_status()
+
+            async for line in response.aiter_lines():
+                if not line:
+                    continue
+
+                # Parse SSE format
+                if line.startswith("data: "):
+                    data_str = line[6:]  # Remove "data: " prefix
+                    if data_str.strip() == "[DONE]":
+                        break
+
+                    try:
+                        data = json.loads(data_str)
+                        # Unwrap response
+                        yield data.get("response", data)
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to parse SSE data: {data_str[:100]}")
+                        continue
+
+
+# Global OAuth manager and Cloud Code Assist client (lazy initialized)
+_oauth_manager: Optional[GeminiOAuthManager] = None
+_cloud_code_client: Optional[CloudCodeAssistClient] = None
+
+
+async def get_cloud_code_client() -> CloudCodeAssistClient:
+    """Get or create the Cloud Code Assist client (singleton)."""
+    global _oauth_manager, _cloud_code_client
+
+    if _cloud_code_client is None:
+        _oauth_manager = GeminiOAuthManager(GEMINI_OAUTH_CREDS_PATH)
+        _cloud_code_client = CloudCodeAssistClient(_oauth_manager)
+        await _cloud_code_client.initialize()
+
+    return _cloud_code_client
+
+
+# ============================================================================
+# Anthropic <-> Gemini Format Converters
+# ============================================================================
+
+def convert_anthropic_to_gemini_format(anthropic_request: "MessagesRequest") -> Dict[str, Any]:
+    """Convert Anthropic API request to Gemini API format for Cloud Code Assist."""
+
+    contents = []
+
+    # Process messages
+    for msg in anthropic_request.messages:
+        role = "user" if msg.role == "user" else "model"
+        parts = []
+
+        content = msg.content
+        if isinstance(content, str):
+            parts.append({"text": content})
+        else:
+            for block in content:
+                if hasattr(block, "type"):
+                    if block.type == "text":
+                        parts.append({"text": block.text})
+                    elif block.type == "tool_use":
+                        parts.append({
+                            "functionCall": {
+                                "name": block.name,
+                                "args": block.input
+                            }
+                        })
+                    elif block.type == "tool_result":
+                        # Tool results in Gemini format
+                        result_content = parse_tool_result_content(block.content)
+                        parts.append({
+                            "functionResponse": {
+                                "name": block.tool_use_id,  # Gemini uses the function name here
+                                "response": {"result": result_content}
+                            }
+                        })
+                    elif block.type == "image":
+                        # Handle image content
+                        source = block.source
+                        if source.get("type") == "base64":
+                            parts.append({
+                                "inlineData": {
+                                    "mimeType": source.get("media_type", "image/png"),
+                                    "data": source.get("data", "")
+                                }
+                            })
+
+        if parts:
+            contents.append({"role": role, "parts": parts})
+
+    # Build Gemini request
+    gemini_request = {
+        "contents": contents,
+        "generationConfig": {
+            "maxOutputTokens": min(anthropic_request.max_tokens, 65536),
+        }
+    }
+
+    # Add temperature if specified
+    if anthropic_request.temperature is not None:
+        gemini_request["generationConfig"]["temperature"] = anthropic_request.temperature
+
+    # Add top_p if specified
+    if anthropic_request.top_p is not None:
+        gemini_request["generationConfig"]["topP"] = anthropic_request.top_p
+
+    # Add top_k if specified
+    if anthropic_request.top_k is not None:
+        gemini_request["generationConfig"]["topK"] = anthropic_request.top_k
+
+    # Add stop sequences if specified
+    if anthropic_request.stop_sequences:
+        gemini_request["generationConfig"]["stopSequences"] = anthropic_request.stop_sequences
+
+    # Add system instruction if present
+    if anthropic_request.system:
+        system_text = ""
+        if isinstance(anthropic_request.system, str):
+            system_text = anthropic_request.system
+        elif isinstance(anthropic_request.system, list):
+            for block in anthropic_request.system:
+                if hasattr(block, 'type') and block.type == "text":
+                    system_text += block.text + "\n\n"
+                elif isinstance(block, dict) and block.get("type") == "text":
+                    system_text += block.get("text", "") + "\n\n"
+
+        if system_text.strip():
+            gemini_request["systemInstruction"] = {
+                "parts": [{"text": system_text.strip()}]
+            }
+
+    # Convert tools to Gemini format
+    if anthropic_request.tools:
+        function_declarations = []
+        for tool in anthropic_request.tools:
+            tool_dict = tool.dict() if hasattr(tool, 'dict') else dict(tool)
+
+            # Clean schema for Gemini
+            parameters = clean_gemini_schema(tool_dict.get("input_schema", {}))
+
+            function_declarations.append({
+                "name": tool_dict["name"],
+                "description": tool_dict.get("description", ""),
+                "parameters": parameters
+            })
+
+        gemini_request["tools"] = [{
+            "functionDeclarations": function_declarations
+        }]
+
+    return gemini_request
+
+
+def convert_gemini_to_anthropic_format(
+    gemini_response: Dict[str, Any],
+    original_request: "MessagesRequest"
+) -> "MessagesResponse":
+    """Convert Gemini API response to Anthropic format."""
+
+    content = []
+
+    # Extract candidates
+    candidates = gemini_response.get("candidates", [])
+    if candidates:
+        candidate = candidates[0]
+        candidate_content = candidate.get("content", {})
+        parts = candidate_content.get("parts", [])
+
+        for part in parts:
+            if "text" in part:
+                content.append({"type": "text", "text": part["text"]})
+            elif "functionCall" in part:
+                func_call = part["functionCall"]
+                content.append({
+                    "type": "tool_use",
+                    "id": f"toolu_{uuid.uuid4().hex[:24]}",
+                    "name": func_call.get("name", ""),
+                    "input": func_call.get("args", {})
+                })
+
+    # Ensure content is not empty
+    if not content:
+        content.append({"type": "text", "text": ""})
+
+    # Map finish reason
+    stop_reason = "end_turn"
+    if candidates:
+        finish_reason = candidates[0].get("finishReason", "STOP")
+        if finish_reason == "MAX_TOKENS":
+            stop_reason = "max_tokens"
+        elif finish_reason == "STOP":
+            stop_reason = "end_turn"
+        elif finish_reason in ("TOOL_USE", "FUNCTION_CALL"):
+            stop_reason = "tool_use"
+
+    # Check if we have tool use in content
+    if any(c.get("type") == "tool_use" for c in content):
+        stop_reason = "tool_use"
+
+    # Extract usage
+    usage_metadata = gemini_response.get("usageMetadata", {})
+    input_tokens = usage_metadata.get("promptTokenCount", 0)
+    output_tokens = usage_metadata.get("candidatesTokenCount", 0)
+
+    return MessagesResponse(
+        id=f"msg_{uuid.uuid4().hex[:24]}",
+        model=original_request.model,
+        role="assistant",
+        content=content,
+        stop_reason=stop_reason,
+        stop_sequence=None,
+        usage=Usage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens
+        )
+    )
+
+
+async def handle_cloud_code_streaming(
+    response_generator: AsyncGenerator[Dict[str, Any], None],
+    original_request: "MessagesRequest"
+) -> AsyncGenerator[str, None]:
+    """Handle streaming responses from Cloud Code Assist API."""
+
+    message_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+    # Send message_start event
+    message_data = {
+        'type': 'message_start',
+        'message': {
+            'id': message_id,
+            'type': 'message',
+            'role': 'assistant',
+            'model': original_request.model,
+            'content': [],
+            'stop_reason': None,
+            'stop_sequence': None,
+            'usage': {
+                'input_tokens': 0,
+                'cache_creation_input_tokens': 0,
+                'cache_read_input_tokens': 0,
+                'output_tokens': 0
+            }
+        }
+    }
+    yield f"event: message_start\ndata: {json.dumps(message_data)}\n\n"
+
+    # Start text content block
+    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+
+    # Send ping
+    yield f"event: ping\ndata: {json.dumps({'type': 'ping'})}\n\n"
+
+    content_index = 0
+    tool_blocks_started = []
+    accumulated_text = ""
+    input_tokens = 0
+    output_tokens = 0
+    has_sent_stop = False
+    text_block_closed = False
+
+    try:
+        async for chunk in response_generator:
+            # Extract usage if present
+            usage_metadata = chunk.get("usageMetadata", {})
+            if usage_metadata:
+                input_tokens = usage_metadata.get("promptTokenCount", input_tokens)
+                output_tokens = usage_metadata.get("candidatesTokenCount", output_tokens)
+
+            # Process candidates
+            candidates = chunk.get("candidates", [])
+            if not candidates:
+                continue
+
+            candidate = candidates[0]
+            candidate_content = candidate.get("content", {})
+            parts = candidate_content.get("parts", [])
+
+            for part in parts:
+                if "text" in part:
+                    text = part["text"]
+                    if text and not text_block_closed:
+                        accumulated_text += text
+                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': text}})}\n\n"
+
+                elif "functionCall" in part:
+                    # Close text block if still open
+                    if not text_block_closed:
+                        text_block_closed = True
+                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+
+                    func_call = part["functionCall"]
+                    content_index += 1
+                    tool_id = f"toolu_{uuid.uuid4().hex[:24]}"
+
+                    # Start tool block
+                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': content_index, 'content_block': {'type': 'tool_use', 'id': tool_id, 'name': func_call.get('name', ''), 'input': {}}})}\n\n"
+
+                    # Send args as JSON delta
+                    args = func_call.get("args", {})
+                    args_json = json.dumps(args)
+                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': content_index, 'delta': {'type': 'input_json_delta', 'partial_json': args_json}})}\n\n"
+
+                    tool_blocks_started.append(content_index)
+
+            # Check for finish reason
+            finish_reason = candidate.get("finishReason")
+            if finish_reason and not has_sent_stop:
+                has_sent_stop = True
+
+                # Close text block if not closed
+                if not text_block_closed:
+                    text_block_closed = True
+                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+
+                # Close any tool blocks
+                for idx in tool_blocks_started:
+                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': idx})}\n\n"
+
+                # Map stop reason
+                stop_reason = "end_turn"
+                if finish_reason == "MAX_TOKENS":
+                    stop_reason = "max_tokens"
+                elif finish_reason in ("TOOL_USE", "FUNCTION_CALL"):
+                    stop_reason = "tool_use"
+                elif tool_blocks_started:
+                    stop_reason = "tool_use"
+
+                # Send message_delta
+                yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': output_tokens}})}\n\n"
+
+                # Send message_stop
+                yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+
+                yield "data: [DONE]\n\n"
+                return
+
+        # If we didn't get a finish reason, close everything
+        if not has_sent_stop:
+            if not text_block_closed:
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+
+            for idx in tool_blocks_started:
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': idx})}\n\n"
+
+            stop_reason = "tool_use" if tool_blocks_started else "end_turn"
+            yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': output_tokens}})}\n\n"
+            yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+            yield "data: [DONE]\n\n"
+
+    except Exception as e:
+        logger.error(f"Error in cloud code streaming: {str(e)}")
+        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'error', 'stop_sequence': None}, 'usage': {'output_tokens': 0}})}\n\n"
+        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+        yield "data: [DONE]\n\n"
+
+
+# ============================================================================
+# End of Gemini OAuth Support
+# ============================================================================
 
 # Helper function to clean schema for Gemini
 def clean_gemini_schema(schema: Any) -> Any:
@@ -1118,7 +1767,47 @@ async def create_message(
             clean_model = clean_model[len("openai/"):]
         
         logger.debug(f"📊 PROCESSING REQUEST: Model={request.model}, Stream={request.stream}")
-        
+
+        # Check if we should use Gemini OAuth (Cloud Code Assist API)
+        if USE_GEMINI_OAUTH and request.model.startswith("gemini/"):
+            logger.debug(f"Using Gemini OAuth mode for model: {request.model}")
+
+            # Get the Cloud Code Assist client
+            client = await get_cloud_code_client()
+
+            # Extract model name (remove gemini/ prefix)
+            model_name = request.model.replace("gemini/", "")
+
+            # Convert Anthropic request to Gemini format
+            gemini_request = convert_anthropic_to_gemini_format(request)
+
+            num_tools = len(request.tools) if request.tools else 0
+            log_request_beautifully(
+                "POST",
+                raw_request.url.path,
+                display_model,
+                f"gemini/{model_name} (OAuth)",
+                len(request.messages),
+                num_tools,
+                200
+            )
+
+            if request.stream:
+                # Handle streaming
+                response_generator = client.stream_generate_content(model_name, gemini_request)
+                return StreamingResponse(
+                    handle_cloud_code_streaming(response_generator, request),
+                    media_type="text/event-stream"
+                )
+            else:
+                # Handle non-streaming
+                start_time = time.time()
+                gemini_response = await client.generate_content(model_name, gemini_request)
+                logger.debug(f"✅ RESPONSE RECEIVED: Model={model_name}, Time={time.time() - start_time:.2f}s")
+
+                anthropic_response = convert_gemini_to_anthropic_format(gemini_response, request)
+                return anthropic_response
+
         # Convert Anthropic request to LiteLLM format
         litellm_request = convert_anthropic_to_litellm(request)
         

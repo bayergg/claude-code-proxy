@@ -11,9 +11,10 @@ A proxy server that lets you use Anthropic clients with Gemini, OpenAI, or Anthr
 
 ### Prerequisites
 
-- OpenAI API key 🔑
-- Google AI Studio (Gemini) API key (if using Google provider) 🔑
+- OpenAI API key 🔑 (if using OpenAI provider)
+- Google AI Studio (Gemini) API key (if using Google provider with API key) 🔑
 - Google Cloud Project with Vertex AI API enabled (if using Application Default Credentials for Gemini) ☁️
+- **OR** Google OAuth via Gemini CLI (recommended for Gemini 3 models) 🔐
 - [uv](https://github.com/astral-sh/uv) installed.
 
 ### Setup 🛠️
@@ -41,10 +42,12 @@ A proxy server that lets you use Anthropic clients with Gemini, OpenAI, or Anthr
 
    *   `ANTHROPIC_API_KEY`: (Optional) Needed only if proxying *to* Anthropic models.
    *   `OPENAI_API_KEY`: Your OpenAI API key (Required if using the default OpenAI preference or as fallback).
-   *   `GEMINI_API_KEY`: Your Google AI Studio (Gemini) API key (Required if `PREFERRED_PROVIDER=google` and `USE_VERTEX_AUTH=true`).
+   *   `GEMINI_API_KEY`: Your Google AI Studio (Gemini) API key (Required if `PREFERRED_PROVIDER=google` and not using OAuth or Vertex).
    *   `USE_VERTEX_AUTH` (Optional): Set to `true` to use Application Default Credentials (ADC) will be used (no static API key required). Note: when USE_VERTEX_AUTH=true, you must configure `VERTEX_PROJECT` and `VERTEX_LOCATION`.
    *   `VERTEX_PROJECT` (Optional): Your Google Cloud Project ID (Required if `PREFERRED_PROVIDER=google` and `USE_VERTEX_AUTH=true`).
    *   `VERTEX_LOCATION` (Optional): The Google Cloud region for Vertex AI (e.g., `us-central1`) (Required if `PREFERRED_PROVIDER=google` and `USE_VERTEX_AUTH=true`).
+   *   `USE_GEMINI_OAUTH` (Optional): Set to `true` to use Google OAuth from `~/.gemini/oauth_creds.json` (created by Gemini CLI). **Required for Gemini 3 models.**
+   *   `GEMINI_OAUTH_CREDS_PATH` (Optional): Custom path to OAuth credentials file. Defaults to `~/.gemini/oauth_creds.json`.
    *   `PREFERRED_PROVIDER` (Optional): Set to `openai` (default), `google`, or `anthropic`. This determines the primary backend for mapping `haiku`/`sonnet`.
    *   `BIG_MODEL` (Optional): The model to map `sonnet` requests to. Defaults to `gpt-4.1` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.5-pro-preview-03-25`. Ignored when `PREFERRED_PROVIDER=anthropic`.
    *   `SMALL_MODEL` (Optional): The model to map `haiku` requests to. Defaults to `gpt-4.1-mini` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.0-flash`. Ignored when `PREFERRED_PROVIDER=anthropic`.
@@ -129,6 +132,8 @@ The following OpenAI models are supported with automatic `openai/` prefix handli
 The following Gemini models are supported with automatic `gemini/` prefix handling:
 - gemini-2.5-pro
 - gemini-2.5-flash
+- gemini-3-flash-preview (Gemini 3 - requires OAuth)
+- gemini-3-pro-preview (Gemini 3 thinking model - requires OAuth)
 
 ### Model Prefix Handling
 The proxy automatically adds the appropriate prefix to model names:
@@ -174,6 +179,37 @@ USE_VERTEX_AUTH=true
 # BIG_MODEL="gemini-2.5-pro" # Optional, it's the default for Google pref
 # SMALL_MODEL="gemini-2.5-flash" # Optional, it's the default for Google pref
 ```
+
+**Example 2c: Prefer Google with OAuth (recommended for Gemini 3 models)**
+
+This method uses Google OAuth credentials from the official Gemini CLI, enabling access to Gemini 3 preview models without requiring API keys or GCP projects.
+
+1. First, authenticate with the Gemini CLI (one-time setup):
+   ```bash
+   npx @anthropic-ai/gemini-cli auth login
+   ```
+   This creates `~/.gemini/oauth_creds.json` with your OAuth tokens.
+
+2. Configure environment variables:
+   ```dotenv
+   USE_GEMINI_OAUTH=true
+   PREFERRED_PROVIDER="google"
+   BIG_MODEL="gemini-3-flash-preview"    # Or gemini-3-pro-preview for thinking model
+   SMALL_MODEL="gemini-3-flash-preview"
+   ```
+
+3. Run the server:
+   ```bash
+   USE_GEMINI_OAUTH=true PREFERRED_PROVIDER=google BIG_MODEL=gemini-3-flash-preview SMALL_MODEL=gemini-3-flash-preview uv run uvicorn server:app --host 0.0.0.0 --port 8082
+   ```
+
+**Available Gemini 3 Models (OAuth only):**
+| Model | Description |
+|-------|-------------|
+| `gemini-3-flash-preview` | Fast Gemini 3 model, good for most tasks |
+| `gemini-3-pro-preview` | Thinking model with internal reasoning (uses more tokens) |
+
+> **Note:** Gemini 3 Pro is a "thinking" model that uses tokens for internal reasoning before generating output. Ensure `max_tokens` is set high enough (e.g., 2000+) to accommodate both thinking and output tokens.
 
 **Example 3: Use Direct Anthropic ("Just an Anthropic Proxy" Mode)**
 ```dotenv
