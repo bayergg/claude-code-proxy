@@ -198,11 +198,6 @@ This method uses Google OAuth credentials from the official Gemini CLI, enabling
    SMALL_MODEL="gemini-3-flash-preview"
    ```
 
-3. Run the server:
-   ```bash
-   USE_GEMINI_OAUTH=true PREFERRED_PROVIDER=google BIG_MODEL=gemini-3-flash-preview SMALL_MODEL=gemini-3-flash-preview uv run uvicorn server:app --host 0.0.0.0 --port 8082
-   ```
-
 **Available Gemini 3 Models (OAuth only):**
 | Model | Description |
 |-------|-------------|
